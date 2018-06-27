@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""
+Optune 'adjust' driver for Java service.
+(C) 2018, Opsani.
+use:
+
+TBD
+
+adjust --version
+adjust --info
+adjust --query app_name
+adjust app_name <settings-file.json
+This script requires a configuration file placed at a fixed location (see
+DESC_FILE constant below). The file should contain the complete formatted
+reply to be sent in response to '--query' (see the TDR External Commands draft
+document), including default values for all settings (which should match the
+value the application would use in case the setting is not provided explicitly
+or is empty). The key under 'components' is the name service to be adjusted
+
+Example DESC_FILE:
+
+components:
+  jira:
+     settings:
+       InitialHeapSize: {}
+       MaxHeapSize: {}
+       MaxGCPauseMillis: {}
+       MaxGCMinorPauseMillis: {}
+       GCTimeRatio: {}
+
+"""
+
+
+from __future__ import print_function    # py2 compatibility
+
+import argparse
+import re
+import subprocess
+import yaml
+
+from adjust import Adjust
+
+DESC = "Java systemctl service adjust driver for Opsani Optune"
+VERSION = "1.0.0"
+HAS_CANCEL = False
+
+
+DESC_FILE = "./app-desc.yaml"
+
+OPTUNE_DRIVER_ANCHOR = "__OPTUNE_DRIVER_ANCHOR__"
+
+
+
+class JavaService(Adjust):
+
+    def _run_cmd(self, cmd):
+        '''
+        Takes a command (as a list of strings), runs it and returns exit_code,
+        stdout (list of lines) and stderr (list of lines)
+        '''
+
+        out = []
+        err = []
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        for line in proc.stdout.readlines():
+            out.append(line)
+
+        for line in proc.stderr.readlines():
+            err.append(line)
+
+        return_code = proc.wait()
+
+        return return_code, out, err
+
+    def _get_service_status(self, svc_name):
+        # Get service status
+        exit_code, out, err = self._run_cmd(['service', svc_name, 'status'])
+
+        if exit_code != 0:
+            msg = "Failed to get status for service {}, command returned " + \
+                "exit code {}. STDOUT {}, STDERR {}".format(
+                    svc_name, exit_code, str(out), str(err))
+            raise Exception(msg)
+
+        # Check if service is running
+        is_running = False
+        found_status = False
+        state = ""
+        for line in out:
+            line = line.decode()
+            m = re.search(r'^\s*Active:\s+(.+)', line)
+            if m:
+                found_status = True
+                state = m.group(1)
+                if state.startswith("active (running)"):
+                    is_running = True
+                else:
+                    is_running = False
+                break
+
+        if not found_status:
+            msg = "Failed to get find status in output of service command. " + \
+                "STDOUT {}, STDERR {}".format(str(out), str(err))
+            raise Exception(msg)
+
+        if not is_running:
+            msg = "Service {} in not running, state is {}".format(
+                svc_name, state)
+            raise Exception(msg)
+
+        return out
+
+    def _get_jvm_settings_for_svc(self, svc_name):
+        '''
+        Takes a service name and returns the JVM flags that this service is
+        running with. To do that, it determines the java command that the
+        service runs and runs that command with `-XX:+PrintFlagsFinal -version`
+        in order to determine the full list of flags that are used.
+
+        Returns a dict where the keys are the flag names and the values are
+        dicts with two keys: type and value of the flag
+        '''
+
+        out = self._get_service_status(svc_name)
+
+        # Get Java command line
+        java_cmd_line = ""
+        found_cgroup_line = False
+        for line in out:
+            line = line.decode()
+
+            if found_cgroup_line:
+                m = re.search(r'^\s*\u2514\u2500\d+\s+(.+)$', line)
+                if m:
+                    java_cmd_line = m.group(1)
+                    break
+                else:
+                    msg = "Failed to get Java command line from service output." + \
+                        "Expecting it in line: {}".format(line)
+                    raise Exception(msg)
+
+            m = re.search(r'^\s*CGroup:\s+', line)
+            if m:
+                found_cgroup_line = True
+                continue
+
+        if java_cmd_line == "":
+            msg = "Failed to get Java command line from service output."
+            raise Exception(msg)
+
+        java_cmd = java_cmd_line.split()
+
+        # Strip non option params (i.e. ones that don't start with '-') from
+        # the back of the command. Then run the remaining command with
+        # `-XX:+PrintFlagsFinal -version` in order to get current settings
+        while True:
+            if len(java_cmd) == 0:
+                break
+            param = java_cmd[-1]
+            if param.startswith("-"):
+                break
+            else:
+                java_cmd.pop()
+
+        if len(java_cmd) == 0:
+            msg = "Failed to strip non option params from Java command"
+            raise Exception(msg)
+
+        java_cmd.append('-XX:+PrintFlagsFinal')
+        java_cmd.append('-version')
+
+        # Get Java defaults for this command line
+        exit_code, out, err = self._run_cmd(java_cmd)
+
+        if exit_code != 0:
+            msg = "Failed to get Java defaults with command {}, command returned " + \
+                "exit code {}. STDOUT {}, STDERR {}".format(
+                    str(java_cmd), exit_code, str(out), str(err))
+            raise Exception(msg)
+
+        java_curr_settings = {}
+        for line in out[1:]:
+            line = line.decode()
+            m = re.search(r'^\s*(\S+)\s+(\S+)\s+:?=\s+(\S+)\s+{.+}$', line)
+            if m:
+                t = m.group(1)
+                name = m.group(2)
+                value = m.group(3)
+
+                if t == "intx" or t == "uint64_t" or t == "uintx":
+                    value = int(value)
+                elif t == "double":
+                    value = float(value)
+                elif t == "bool":
+                    value = True if value == "true" else False
+
+                java_curr_settings[name] = {
+                    "type": t,
+                    "value": value,
+                }
+
+        return java_curr_settings
+
+    def _parse_app_desc(self):
+        '''
+        load the user-defined application descriptor
+        '''
+
+        try:
+            f = open(DESC_FILE)
+            d = yaml.load(f)
+        except IOError as e:
+            raise Exception(
+                "cannot read configuration from {}:{}".format(DESC_FILE, e.strerror))
+        except yaml.error.YAMLError as e:
+            raise Exception("syntax error in {}: {}".format(DESC_FILE, str(e)))
+        # everything else: raise
+
+        # Valchk
+        if not "components" in d:
+            raise Exception(
+                "Missing components key in app descriptor {}".format(DESC_FILE))
+
+        # Valchk
+        if len(d["components"].keys()) != 1:
+            raise Exception(
+                "App descriptor error: must have exactly one component")
+
+        return d
+
+    def query(self):
+        # Parse app descriptor
+        desc = self._parse_app_desc()
+
+        svc_name = list(desc["components"].keys())[0]
+
+        # Get current JVM settings
+        java_curr_settings = self._get_jvm_settings_for_svc(svc_name)
+
+        # Populate settings from the app descriptor with their actual values
+        settings = desc["components"][svc_name]["settings"]
+        for k in settings.keys():
+            if not k in settings:
+                raise Exception(
+                    "Counld not find setting {} in current JVM settings".format(k))
+
+            curr = java_curr_settings[k]
+            settings[k]["value"] = curr["value"]
+            settings[k]["type"] = "range"
+            settings[k]["step"] = 1
+
+            # Convert bools to an int with range 0-1
+            if curr["type"] == "bool":
+                settings[k]["value"] = 1 if curr["value"] else 0
+                settings[k]["min"] = 0
+                settings[k]["max"] = 1
+
+        ret = {
+            "components": {
+                svc_name: {
+                    "settings": settings
+                }
+            }
+        }
+
+        return ret
+
+    def adjust(self):
+        # Parse app descriptor
+        desc = self._parse_app_desc()
+
+        svc_name = list(desc["components"].keys())[0]
+
+        try:
+            env_file = desc["driver"]["javaservice"]["env_file"]
+        except Exception as e:
+            raise Exception(
+                "Missing env_file configuration in driver section of app descriptor")
+
+        # Validate input
+        if not "application" in self.input_data:
+            raise Exception("Invalid input: missing application key")
+
+        if not "components" in self.input_data["application"]:
+            raise Exception(
+                "Invalid input: missing application.components key")
+
+        if not svc_name in self.input_data["application"]["components"]:
+            raise Exception(
+                "Invalid input: component {} not found in input data".format(
+                    svc_name
+                ))
+
+        if not "settings" in self.input_data["application"]["components"][svc_name]:
+            raise Exception(
+                "Invalid input: settings key not present for component " + svc_name
+            )
+
+        settings = self.input_data["application"]["components"][svc_name]["settings"]
+
+        if not isinstance(settings, dict):
+            raise Exception(
+                "Invalid input: settings for component {} must be a dict".format(
+                    svc_name
+                ))
+
+        # Get current JVM settings (this will raise an exception if not running)
+        java_curr_settings = self._get_jvm_settings_for_svc(svc_name)
+
+        # Set values in setenv.sh
+        self.debug("Setting values in file", env_file, ":", settings)
+
+        lines = []
+        anchor_found = False
+        optune_settings = ""
+
+        # Convert Optune seetings to java settings
+        for k in settings.keys():
+            v = settings[k]
+            curr = java_curr_settings[k]
+            if curr["type"] == "bool":
+                optune_settings += " -XX:{}{}".format("+" if v else "-", k)
+            else:
+                optune_settings += " -XX:{}={}".format(k, v)
+
+        anchor_line = 'CATALINA_OPTS="${CATALINA_OPTS} ' + optune_settings + \
+            '" # ' + OPTUNE_DRIVER_ANCHOR + "\n"
+
+        try:
+            with open(env_file, 'r') as f:
+                for line in f:
+                    if OPTUNE_DRIVER_ANCHOR in line:
+                        anchor_found = True
+                        self.debug(
+                            "Found existing anchor line in file {}: {}".format(
+                                env_file, line))
+                        self.debug(
+                            "Replacing it with line: {}".format(anchor_line))
+                        lines.append(anchor_line)
+                    else:
+                        lines.append(line)
+        except Exception as e:
+            raise Exception(
+                "Failed to read env file {}: {}".format(env_file, str(e))
+            )
+
+        if not anchor_found:
+            self.debug("Adding anchor line in file {}: {}".format(
+                env_file, anchor_line))
+            lines.append(anchor_line)
+
+        try:
+            with open(env_file, 'w') as f:
+                for line in lines:
+                    f.write(line)
+        except Exception as e:
+            raise Exception(
+                "Failed to write env file {}: {}".format(env_file, str(e))
+            )
+
+        # Restart service
+        self.debug("Restarting service")
+        exit_code, out, err = self._run_cmd(['service', svc_name, 'restart'])
+
+        if exit_code != 0:
+            msg = "Failed to restart service {}, command returned " + \
+                "exit code {}. STDOUT {}, STDERR {}".format(
+                    svc_name, exit_code, str(out), str(err))
+            raise Exception(msg)
+
+        self.debug("Service successfully restarted")
+
+        # Get service status, make sure they match what we wanted them to be
+        java_curr_settings = self._get_jvm_settings_for_svc(svc_name)
+
+        # Make sure current they match what we wanted them to be
+        miss_match = False
+        for k, v in settings.items():
+            if not java_curr_settings[k]["value"] == v:
+                miss_match = True
+                self.debug(
+                    "WARNING: setting", k, "was supposed to change to value",
+                    v, "but current value after change is", java_curr_settings[k]["value"])
+
+        if not miss_match:
+            self.debug("Sucessfully updated all settings")
+
+
+if __name__ == '__main__':
+    driver = JavaService(VERSION, DESC, HAS_CANCEL)
+    driver.run()
