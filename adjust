@@ -319,7 +319,7 @@ class JavaService(Adjust):
 
         # Convert Optune seetings to java settings
         for k in settings.keys():
-            v = settings[k]
+            v = settings[k]["value"]
             curr = java_curr_settings[k]
             if curr["type"] == "bool":
                 optune_settings += " -XX:{}{}".format("+" if v else "-", k)
@@ -379,7 +379,7 @@ class JavaService(Adjust):
         # Make sure current they match what we wanted them to be
         miss_match = False
         for k, v in settings.items():
-            if not java_curr_settings[k]["value"] == v:
+            if not java_curr_settings[k]["value"] == v["value"]:
                 miss_match = True
                 self.debug(
                     "WARNING: setting", k, "was supposed to change to value",
