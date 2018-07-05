@@ -323,6 +323,8 @@ class JavaService(Adjust):
             curr = java_curr_settings[k]
             if curr["type"] == "bool":
                 optune_settings += " -XX:{}{}".format("+" if v else "-", k)
+            elif curr["type"] == "intx" or curr["type"] == "uint64_t" or curr["type"] == "uintx":
+                optune_settings += " -XX:{}={}".format(k, int(v))
             else:
                 optune_settings += " -XX:{}={}".format(k, v)
 
