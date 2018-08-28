@@ -1,51 +1,57 @@
 #!/usr/bin/env python3
 """
-Optune 'adjust' driver for Java service.
-(C) 2018, Opsani.
-use:
+Optune 'adjust' driver for a Java service running under Linux systemd.
+(C) 2018, Opsani. All Rights Reserved.
+See LICENSE file for license terms
 
-TBD
+use:
 
 adjust --version
 adjust --info
 adjust --query app_name
 adjust app_name <settings-file.json
+
 This script requires a configuration file placed at a fixed location (see
-DESC_FILE constant below). The file should contain the complete formatted
-reply to be sent in response to '--query' (see the TDR External Commands draft
-document), including default values for all settings (which should match the
-value the application would use in case the setting is not provided explicitly
-or is empty). The key under 'components' is the name service to be adjusted
+CFG_FILE constant below).
 
-Example DESC_FILE:
+Example CFG_FILE:
 
-components:
-  jira:
-     settings:
-       InitialHeapSize: {}
-       MaxHeapSize: {}
-       MaxGCPauseMillis: {}
-       MaxGCMinorPauseMillis: {}
-       GCTimeRatio: {}
+javaservice:
+    name: myjavaservice                     # name of service (used for systemctl and as Optune component)
+    env_file: /path/to/env/vars/file.sh     # path to script with env vars to modify
 
+    readiness_probe:                        # readiness probe configuration, omit object to disable
+        url: 'https://localhost/healthz'    # URL to check, must be valid URL
+        expect: 'OK'                        # response expect string; omit to skip check
+        timeout: 300                        # how many seconds to wait for readiness, default 300
+
+    settings:
+        InitialHeapSize: {}
+        MaxHeapSize: {}
+        MaxGCPauseMillis: {}
+        MaxGCMinorPauseMillis: {}
+        GCTimeRatio: {}
 """
-
-
-from __future__ import print_function    # py2 compatibility
 
 import argparse
 import re
 import subprocess
 import yaml
+import requests # needed for readiness probe (remove if moved to base class)
+import time     # needed for readiness probe (remove if moved to base class)
+import json     # needed for progress report (remove if moved to base class)
 
 from adjust import Adjust
 
+DRIVER_NAME = 'javaservice'
 DESC = "Java systemctl service adjust driver for Opsani Optune"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HAS_CANCEL = False
 
+READY_POLL_INTERVAL = 15    # minimum seconds between readiness probes
+READY_POLL_TIMEOUT  = 30    # max. seconds to wait for response between progress reports
 
-DESC_FILE = "./app-desc.yaml"
+CFG_FILE = "./config.yaml"
 
 OPTUNE_DRIVER_ANCHOR = "__OPTUNE_DRIVER_ANCHOR__"
 
@@ -165,6 +171,10 @@ class JavaService(Adjust):
             else:
                 java_cmd.pop()
 
+        # save and remove memory pool settings  (pn - debug) - initial pool size is a problem
+        java_mem_opts = [ x for x in java_cmd if x.startswith('-Xms') ]
+        java_cmd = [ x for x in java_cmd if not x.startswith('-Xms') ]
+
         if len(java_cmd) == 0:
             msg = "Failed to strip non option params from Java command"
             raise Exception(msg)
@@ -202,6 +212,8 @@ class JavaService(Adjust):
                     "value": value,
                 }
 
+        #TODO: use java_mem_opts, if not empty, to update the values returned
+
         return java_curr_settings
 
     def _parse_app_desc(self):
@@ -210,24 +222,37 @@ class JavaService(Adjust):
         '''
 
         try:
-            f = open(DESC_FILE)
+            f = open(CFG_FILE)
             d = yaml.load(f)
         except IOError as e:
             raise Exception(
-                "cannot read configuration from {}:{}".format(DESC_FILE, e.strerror))
+                "cannot read configuration from {}:{}".format(CFG_FILE, e.strerror))
         except yaml.error.YAMLError as e:
-            raise Exception("syntax error in {}: {}".format(DESC_FILE, str(e)))
+            raise Exception("syntax error in {}: {}".format(CFG_FILE, str(e)))
         # everything else: raise
 
-        # Valchk
-        if not "components" in d:
-            raise Exception(
-                "Missing components key in app descriptor {}".format(DESC_FILE))
+        # extract only this adjust driver's section
+        try:
+            d = d[DRIVER_NAME]
+        except Exception:
+            raise Exception('Missing config object "{}" at root level in config file {}'.format(DRIVER_NAME, CFG_FILE))
 
-        # Valchk
-        if len(d["components"].keys()) != 1:
-            raise Exception(
-                "App descriptor error: must have exactly one component")
+        # fail if required keys are missing (but allow extras)
+        missing = set(('name', 'settings', 'env_file')) - set(d.keys())  # any keys required but not in config desc
+        if missing:
+            raise Exception('Config file {}, object {} is missing required key(s): {}'.format(CFG_FILE, DRIVER_NAME, ', '.join(sorted(list(missing)))))
+
+        # check readiness probe configuration (now, not after adjust)
+        try:
+            rp = d['readiness_probe']
+        except KeyError:
+            pass # ok not to have a readiness probe defined, won't wait for readiness
+        else:
+            assert isinstance(rp, dict), "The readiness_probe attribute, if defined, must be an object, not {}".format(type(rp).__name__)
+            assert 'url' in rp, "The url setting is required when a readiness_probe is defined; it is missing"
+            extras = set(rp.keys()) - set(('url', 'timeout', 'expect'))
+            if extras:
+                raise Exception('One or more unrecognized settings in the readiness_probe configuration: {}'.format(', '.join(sorted(list(extras)))))
 
         return d
 
@@ -235,22 +260,22 @@ class JavaService(Adjust):
         # Parse app descriptor
         desc = self._parse_app_desc()
 
-        svc_name = list(desc["components"].keys())[0]
+        svc_name = desc['name']
 
         # Get current JVM settings
         java_curr_settings = self._get_jvm_settings_for_svc(svc_name)
 
         # Populate settings from the app descriptor with their actual values
-        settings = desc["components"][svc_name]["settings"]
+        settings = desc['settings']
+        missing = set(settings.keys()) - set(java_curr_settings.keys())
+        if missing:
+            raise Exception('Config file {}, object {} has one or more settings not known to JVM: {}'.format(CFG_FILE, DRIVER_NAME, ', '.join(sorted(list(missing)))))
         for k in settings.keys():
-            if not k in settings:
-                raise Exception(
-                    "Counld not find setting {} in current JVM settings".format(k))
-
             curr = java_curr_settings[k]
             settings[k]["value"] = curr["value"]
             settings[k]["type"] = "range"
             settings[k]["step"] = 1
+            # TODO: allow ranges and step to be defined in the config file
 
             # Convert bools to an int with range 0-1
             if curr["type"] == "bool":
@@ -258,6 +283,7 @@ class JavaService(Adjust):
                 settings[k]["min"] = 0
                 settings[k]["max"] = 1
 
+        # construct app settings descriptor
         ret = {
             "components": {
                 svc_name: {
@@ -272,13 +298,8 @@ class JavaService(Adjust):
         # Parse app descriptor
         desc = self._parse_app_desc()
 
-        svc_name = list(desc["components"].keys())[0]
-
-        try:
-            env_file = desc["driver"]["javaservice"]["env_file"]
-        except Exception as e:
-            raise Exception(
-                "Missing env_file configuration in driver section of app descriptor")
+        svc_name = desc['name']
+        env_file = desc['env_file']
 
         # Validate input
         if not "application" in self.input_data:
@@ -306,6 +327,8 @@ class JavaService(Adjust):
                 "Invalid input: settings for component {} must be a dict".format(
                     svc_name
                 ))
+
+        self.report_progress(1, msg="Configuration adjustment started, reading configuration file")
 
         # Get current JVM settings (this will raise an exception if not running)
         java_curr_settings = self._get_jvm_settings_for_svc(svc_name)
@@ -362,6 +385,7 @@ class JavaService(Adjust):
             raise Exception(
                 "Failed to write env file {}: {}".format(env_file, str(e))
             )
+        self.report_progress(10, msg="Configuration updated ok, restarting service")
 
         # Restart service
         self.debug("Restarting service")
@@ -375,21 +399,122 @@ class JavaService(Adjust):
 
         self.debug("Service successfully restarted")
 
+        # wait for service to start responding
+        if 'readiness_probe' in desc:
+            self.report_progress(50, msg="Service started ok, waiting for readiness")
+            self.debug("Waiting for service to become ready to serve")
+            self.ready_wait(
+                probe           = desc['readiness_probe'],
+                progress_cb     = self.report_progress,
+                progress_base_perc = 50)
+            self.debug("Service is ready and serving requests")
+
         # Get service status, make sure they match what we wanted them to be
         java_curr_settings = self._get_jvm_settings_for_svc(svc_name)
 
         # Make sure current they match what we wanted them to be
-        miss_match = False
+        mismatches = []     # list of strings with mismatched values
         for k, v in settings.items():
             if not java_curr_settings[k]["value"] == v["value"]:
-                miss_match = True
+                mismatches.append('"{}" is "{}" instead of "{}"'.format(k, java_curr_settings[k]["value"], v))
                 self.debug(
                     "WARNING: setting", k, "was supposed to change to value",
                     v, "but current value after change is", java_curr_settings[k]["value"])
 
-        if not miss_match:
+        # report progress/mismatches
+        if mismatches:
+            self.report_progress(100, message="Warning: actual settings don't match requested: {}".format('; '.join(mismatches)))
+        else:
             self.debug("Sucessfully updated all settings")
+            self.report_progress(100)
 
+    def ready_wait(self, probe, progress_cb=None, progress_base_perc=50):
+        """
+        Wait until the target service starts serving http(s) requests successfully
+
+        Args:
+            probe - dict with readiness probe configuration, only the following keys:
+                url - URL to try to fetch (http or https; format as acceptable to requests module)
+                expect - if not None, string to expect to find in response data
+                timeout - how long to wait for successful response, seconds (default, 300 sec)
+            progress_cb - callback function to call periodically to report progress
+            progess_perc_base - base value to report process as (default, starts from 50% up)
+
+        Success: if url get returns status 200 and, if expect string is provided,
+        the expect string is found in the response.
+        Raises TimeoutError if not successful within the timeout period
+        Periodically (every 30 seconds) sends progress report toward the timeout value,
+        with percentage completion calculated as % of remaining time, starting from the base percentage
+
+        Note: for https, currently calls with verify disabled (easy handling of self-signed certificates)
+        """
+        def calc_perc(progress, base_perc=0): # progress is 0..1, base_perc is 0..99
+            rem = 100-base_perc     # percent remaining for readiness probe progress
+            if rem < 1:             # ensure at least 1 (not 0 or very close to it)
+                rem = 1
+            perc = base_perc + progress*rem     # overall progress percentage
+            return int(perc+0.5) # quick rounding without importing math
+
+        # parse probe fields (syntax/values have been checked in parse_desc())
+        url = probe.pop('url')
+        expect = probe.pop('expect', None)
+        timeout = probe.pop('timeout', 300)
+        if timeout < 0:
+            timeout = 10    # very short but not 0; reasonable and also prevents zerodiv in progress calc
+
+        start_ts = time.time()
+        end_ts = start_ts + timeout
+        ready = False
+        last_poll_error = ''        # ensure defined outside of while, jic
+
+        # try until success or timeout
+        while not ready:
+            last_poll_error = ''    # clear before each poll attempt
+            try:
+                # break if timed out
+                request_ts = time.time()
+                if request_ts > end_ts:
+                    break
+
+                r = requests.get(url, verify=False, timeout=READY_POLL_TIMEOUT)
+                assert(r.status_code == 200), "http status " + str(r.status_code)
+                if expect is not None:
+                    assert(str(expect) in r.text), "expected string not in response"
+
+                ready = True
+                self.debug("Readiness check succeeded")
+
+            except Exception as e:
+                last_poll_error = str(e)
+                self.debug("Readiness check failed:", last_poll_error)
+
+                # ensure we don't poll too often (in case request completes quickly and indicates failure)
+                response_ts = time.time()
+                sleep_time  = request_ts + READY_POLL_INTERVAL - response_ts # ensure READY_POLL_INTERVAL second between polls
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+                # report progress
+                if progress_cb:
+                    progress = (time.time() - start_ts)/timeout  # 0..1 ; note that timeout cannot be 0, so no zerodiv possible
+                    progress_cb(calc_perc(progress, progress_base_perc), msg = 'waiting for service to become ready')
+
+        if not ready:
+            raise Exception("Readiness check did not succeed in {} seconds; last result was {}".format(timeout, last_poll_error))
+
+
+    def report_progress(self, perc, msg = None):
+        """
+        Report progress
+
+        Args:
+            perc: percentage, int, 0..100
+            msg: message, optional
+        """
+        p = { 'progress' : perc }
+        if msg:
+            p['message'] = str(msg)
+        print(json.dumps(p), flush = True)
 
 if __name__ == '__main__':
     driver = JavaService(VERSION, DESC, HAS_CANCEL)

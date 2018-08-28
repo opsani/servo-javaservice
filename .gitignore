@@ -1,0 +1,7 @@
+# omit files/symlinks that may have been used for testing
+servo
+adjust.py
+config.yaml
+
+# omit python-specific temp files
+__pycache__/*
