@@ -223,7 +223,7 @@ class JavaService(Adjust):
 
         try:
             f = open(CFG_FILE)
-            d = yaml.load(f)
+            d = yaml.safe_load(f)
         except IOError as e:
             raise Exception(
                 "cannot read configuration from {}:{}".format(CFG_FILE, e.strerror))
@@ -476,7 +476,7 @@ class JavaService(Adjust):
                 if request_ts > end_ts:
                     break
 
-                r = requests.get(url, verify=False, timeout=READY_POLL_TIMEOUT)
+                r = requests.get(url, verify=False, timeout=READY_POLL_TIMEOUT) # nosec (Allow self-signed certs)
                 assert(r.status_code == 200), "http status " + str(r.status_code)
                 if expect is not None:
                     assert(str(expect) in r.text), "expected string not in response"
